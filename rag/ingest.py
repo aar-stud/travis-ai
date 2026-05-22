@@ -5,14 +5,17 @@ Reads knowledge_base/faqs.txt, splits strictly by Q&A pairs,
 cleans each chunk (strips section headers, blank lines),
 embeds, and stores in ChromaDB.
 
+FIXED: chromadb and sentence_transformers imports are now inside
+main() rather than at module level. ingest.py is imported by
+main.py at module level for the auto-ingest check — any top-level
+ML imports here triggered C extension loading before torch was stable.
+
 Usage (from ai_services/ folder):
     python rag/ingest.py
 """
 
 import os
 import re
-import chromadb
-from sentence_transformers import SentenceTransformer
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 KB_DIR     = os.path.abspath(os.path.join(BASE_DIR, "..", "knowledge_base"))
@@ -37,7 +40,7 @@ def clean_chunk(block: str) -> str:
     return block.strip()
 
 
-def load_and_chunk(kb_dir: str) -> list[dict]:
+def load_and_chunk(kb_dir: str) -> list:
     """
     Load every .txt file in kb_dir.
     Split strictly on lines that start with 'Q:' — one chunk per Q&A pair.
@@ -54,7 +57,7 @@ def load_and_chunk(kb_dir: str) -> list[dict]:
 
         # Split so every piece starts with Q:
         raw_blocks = re.split(r"(?m)^(?=Q:)", text)
-        blocks = [clean_chunk(b) for b in raw_blocks if b.strip().startswith("Q:")]
+        blocks     = [clean_chunk(b) for b in raw_blocks if b.strip().startswith("Q:")]
 
         # Keep only blocks that have both a question AND an answer
         valid = [b for b in blocks if "Q:" in b and "A:" in b]
@@ -67,13 +70,20 @@ def load_and_chunk(kb_dir: str) -> list[dict]:
             })
 
         skipped = len(blocks) - len(valid)
-        print(f"[ingest] {fname}: {len(valid)} chunks"
-              + (f" ({skipped} skipped — no A: found)" if skipped else ""))
+        print(
+            f"[ingest] {fname}: {len(valid)} chunks"
+            + (f" ({skipped} skipped — no A: found)" if skipped else "")
+        )
 
     return all_chunks
 
 
 def main():
+    # Lazy imports — only loaded when ingest actually runs,
+    # not when the module is imported by main.py at startup.
+    import chromadb
+    from sentence_transformers import SentenceTransformer
+
     print("\n=== TRAVIS RAG Ingest ===\n")
 
     chunks = load_and_chunk(KB_DIR)
@@ -100,8 +110,8 @@ def main():
 
     # Embed
     print(f"[ingest] Loading model '{MODEL_NAME}' ...")
-    model = SentenceTransformer(MODEL_NAME)
-    texts = [c["text"] for c in chunks]
+    model      = SentenceTransformer(MODEL_NAME)
+    texts      = [c["text"] for c in chunks]
     print("[ingest] Embedding ...")
     embeddings = model.encode(texts, show_progress_bar=True, batch_size=32).tolist()
 
@@ -120,10 +130,10 @@ def main():
         metadata={"hnsw:space": "cosine"},
     )
     collection.add(
-        ids=[c["id"] for c in chunks],
-        embeddings=embeddings,
-        documents=texts,
-        metadatas=[{"source": c["source"]} for c in chunks],
+        ids        = [c["id"]     for c in chunks],
+        embeddings = embeddings,
+        documents  = texts,
+        metadatas  = [{"source": c["source"]} for c in chunks],
     )
 
     print(f"\n[ingest] Done — {len(chunks)} chunks indexed into '{COLLECTION}'.")

@@ -45,7 +45,6 @@ onnxruntime==1.16.3
 chromadb==0.4.24
 
 # Translation model (custom seq2seq)
-torchtext==0.16.2
 spacy==3.7.4
 
 # Translation fallback when torchtext DLL fails on Windows

@@ -1,24 +1,30 @@
 """
 embedder.py — Singleton SentenceTransformer wrapper.
 
-The model is loaded ONCE at startup via get_model() which is called
-from main.py's @app.on_event("startup"). All subsequent calls reuse
-the same in-memory model — zero cold-start lag on real requests.
+FIXED: sentence_transformers import is now lazy (deferred to first call).
+Previously the module-level import triggered torch._C loading before
+main.py's pre-load guard ran, corrupting the entire ML stack.
 
+The model is loaded ONCE on first get_model() call and reused for all
+subsequent calls — zero cold-start lag on real requests.
 Must use the SAME model name as ingest.py.
 """
 
-from sentence_transformers import SentenceTransformer
 import numpy as np
 
 EMBED_MODEL = "all-MiniLM-L6-v2"
-_model: SentenceTransformer | None = None
+_model = None
 
 
-def get_model() -> SentenceTransformer:
-    """Return the singleton model, loading it on first call."""
+def get_model():
+    """Return the singleton SentenceTransformer, loading it on first call."""
     global _model
     if _model is None:
+        # Lazy import — torch must already be stable before this runs.
+        # In production this is guaranteed because main.py's module-level
+        # torch pre-load block runs before any router imports get_model().
+        from sentence_transformers import SentenceTransformer
+
         print(f"[embedder] Loading '{EMBED_MODEL}' ...")
         _model = SentenceTransformer(EMBED_MODEL)
         # Warm up internal tokenizer cache with a dummy encode

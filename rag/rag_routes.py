@@ -5,6 +5,12 @@ rag_routes.py — FastAPI router exposing the RAG pipeline.
   Body:    { "query": "what is imps" }
   Returns: { "response": "...", "sources": [...], "chunks_used": N }
 
+FIXED: embed_query, retrieve, and generate are now imported lazily
+inside each endpoint function, not at module level. The previous
+top-level imports triggered sentence_transformers and chromadb C
+extensions before main.py's torch pre-load guard ran, breaking
+every other ML service.
+
 No LLM API call — answer extracted directly from retrieved chunks.
 Typical latency: <150ms (embedding model + ChromaDB lookup + extraction).
 """
@@ -12,10 +18,6 @@ Typical latency: <150ms (embedding model + ChromaDB lookup + extraction).
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-
-from rag.embedder import embed_query
-from rag.retriever import retrieve
-from rag.generator import generate
 
 rag_router = APIRouter(prefix="/api", tags=["RAG"])
 
@@ -30,6 +32,12 @@ class RAGRequest(BaseModel):
 
 @rag_router.post("/rag")
 async def rag_query(request: RAGRequest):
+    # Lazy imports — safe here because torch is already stable
+    # by the time the first real request arrives.
+    from rag.embedder  import embed_query
+    from rag.retriever import retrieve
+    from rag.generator import generate
+
     query = request.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
@@ -43,16 +51,18 @@ async def rag_query(request: RAGRequest):
 
         # 3. Filter by relevance — strict threshold avoids pulling
         #    unrelated chunks when the query is misclassified
-        relevant_chunks = [c for c in raw_chunks if c["distance"] <= RELEVANCE_THRESHOLD]
+        relevant_chunks = [
+            c for c in raw_chunks if c["distance"] <= RELEVANCE_THRESHOLD
+        ]
 
         # Fallback: if NOTHING passes, return a graceful "not found" message
-        # rather than the closest unrelated chunk
         if not relevant_chunks:
             return JSONResponse(
                 content={
                     "response": (
-                        "I could not find specific information about that in the knowledge base. "
-                        "Please contact customer support or visit the nearest branch for help."
+                        "I could not find specific information about that in "
+                        "the knowledge base. Please contact customer support or "
+                        "visit the nearest branch for help."
                     ),
                     "sources":     [],
                     "chunks_used": 0,
