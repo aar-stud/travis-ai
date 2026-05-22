@@ -1,18 +1,16 @@
 import os
+import sys
 import warnings
 from contextlib import asynccontextmanager
 
-# Suppress PyTorch nested tensor warnings
+# =========================================================
+# Suppress warnings early — before any ML import
+# =========================================================
+
 warnings.filterwarnings("ignore", category=UserWarning, module=".*transformer.*")
 warnings.filterwarnings("ignore", message=".*nested tensor.*")
-
-# Suppress numpy deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
-
-import uvicorn
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
 # Configuration
@@ -20,6 +18,61 @@ from fastapi.middleware.cors import CORSMiddleware
 
 PORT = int(os.environ.get("PORT", 5001))
 CHROMA_PATH = "./knowledge_base/chroma_store"
+
+# =========================================================
+# STEP 1 — Force torch._C to load once, cleanly, FIRST
+# =========================================================
+# On Windows, torch bundles its own DLLs. If any other package
+# (spacy, torchtext, onnxruntime) triggers a torch import before
+# this block, torch._C is registered under a different DLL path,
+# causing "cannot load module more than once" and
+# "name '_C' is not defined" across the entire process.
+# =========================================================
+
+if sys.platform == "win32":
+    import site as _site
+    for _sp in _site.getsitepackages():
+        _torch_lib = os.path.join(_sp, "torch", "lib")
+        if os.path.isdir(_torch_lib):
+            os.add_dll_directory(_torch_lib)
+            break
+
+try:
+    import torch
+    import torch.nn
+    _ = torch.zeros(1)  # force full C extension initialisation
+    print(f"[init] torch {torch.__version__} OK")
+except Exception as _e:
+    print(f"[init] torch FAILED — all ML services will be unavailable: {_e}")
+
+# =========================================================
+# STEP 2 — ChromaDB: ingest BEFORE any router touches it
+# =========================================================
+# Routers are imported at module-load time (below), so ChromaDB
+# must exist on disk before that happens, or the RAG router's
+# import-time collection open will fail.
+# =========================================================
+
+if not os.path.exists(CHROMA_PATH):
+    print("[init] ChromaDB not found.")
+    print("[init] Running RAG ingestion pipeline...\n")
+    try:
+        from rag.ingest import main as ingest_main
+
+        ingest_main()
+        print("[init] ChromaDB successfully created.\n")
+    except Exception as _e:
+        print(f"[init] ChromaDB ingest FAILED: {_e}\n")
+else:
+    print("[init] Existing ChromaDB found.\n")
+
+# =========================================================
+# STEP 3 — FastAPI + middleware (safe to import now)
+# =========================================================
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
 # App
@@ -33,35 +86,13 @@ async def lifespan(app: FastAPI):
     """
     Startup + shutdown lifecycle.
     Handles:
-    - auto-ingest if ChromaDB missing
-    - model warmup
-    - service initialization
+    - model warmup  (torch and ChromaDB are already stable by this point)
+    - service health summary
     """
 
     print("\n================================================")
     print(" TRAVIS Multi-Service AI API Starting")
     print("================================================\n")
-
-    # =====================================================
-    # Auto-create ChromaDB if missing
-    # =====================================================
-
-    try:
-        if not os.path.exists(CHROMA_PATH):
-            print("[startup] ChromaDB not found.")
-            print("[startup] Running RAG ingestion pipeline...\n")
-
-            from rag.ingest import main as ingest_main
-
-            ingest_main()
-
-            print("[startup] ChromaDB successfully created.\n")
-
-        else:
-            print("[startup] Existing ChromaDB found.\n")
-
-    except Exception as e:
-        print(f"[startup] ChromaDB initialization failed: {e}\n")
 
     # =====================================================
     # Warmup Models
@@ -172,7 +203,11 @@ app.add_middleware(
 )
 
 # =========================================================
-# Safe Router Loading
+# STEP 4 — Safe Router Loading
+# =========================================================
+# torch._C is already in the module registry (Step 1) and
+# ChromaDB exists on disk (Step 2), so all router imports
+# are now safe.
 # =========================================================
 
 
@@ -202,6 +237,7 @@ def _load_qa():
 
 _try_include("qa (seq2seq)", _load_qa)
 
+
 # 2. Translation
 def _load_translation():
     from translation.translate_routes import translation_router
@@ -210,6 +246,7 @@ def _load_translation():
 
 
 _try_include("translation (en→te)", _load_translation)
+
 
 # 3. TTS
 def _load_tts():
@@ -220,6 +257,7 @@ def _load_tts():
 
 _try_include("tts", _load_tts)
 
+
 # 4. Classifier
 def _load_classifier():
     from category.classifer_routes import router as classifier_router
@@ -228,6 +266,7 @@ def _load_classifier():
 
 
 _try_include("classifier", _load_classifier)
+
 
 # 5. RAG
 def _load_rag():
