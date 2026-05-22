@@ -40,6 +40,9 @@ RUN mkdir -p /app/.cache/sentence_transformers && \
     mkdir -p /app/.cache/huggingface && \
     chown -R travis:travis /app
 
+RUN find /usr/local/lib/python3.11 -type d -name "__pycache__" -exec rm -rf {} +
+RUN find /app -type d -name "__pycache__" -exec rm -rf {} +
+
 USER travis
 
 # Set cache directories to writable locations
@@ -56,4 +59,4 @@ EXPOSE 5001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')" || exit 1
 
-CMD ["python", "main.py"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5001"]

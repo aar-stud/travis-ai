@@ -19,8 +19,11 @@ uvicorn[standard]==0.27.1
 # pydantic - use v1 branch (spacy requires it)
 pydantic==1.10.14
 
-# NumPy - must be <2.0 for torch 2.1.2
-numpy==1.26.4
+# NumPy - pinned tightly; _signature_descriptor removed in 1.25+
+numpy==1.24.4
+
+# scikit-learn - required for classifier model compatibility
+scikit-learn>=1.0.0
 
 # -----------------------------------------------------------------------
 # CRITICAL: transformers must be <=4.35.2
@@ -35,6 +38,8 @@ accelerate==0.24.1
 
 # RAG - sentence-transformers must use the pinned transformers above
 sentence-transformers==2.7.0
+# onnxruntime 1.16.3 has fewer Windows bundled-lib conflicts than 1.17.0
+onnxruntime==1.16.3
 
 # chromadb 0.4.24 - stable schema (0.5+ changed SQLite schema -> "no such column: topic")
 chromadb==0.4.24

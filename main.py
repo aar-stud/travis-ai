@@ -1,5 +1,14 @@
 import os
+import warnings
 from contextlib import asynccontextmanager
+
+# Suppress PyTorch nested tensor warnings
+warnings.filterwarnings("ignore", category=UserWarning, module=".*transformer.*")
+warnings.filterwarnings("ignore", message=".*nested tensor.*")
+
+# Suppress numpy deprecation warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import uvicorn
 from fastapi import FastAPI
@@ -264,10 +273,10 @@ async def health():
 # Main
 # =========================================================
 
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=PORT,
-        reload=False,
-    )
+# if __name__ == "__main__":
+#     uvicorn.run(
+#         "main:app",
+#         host="0.0.0.0",
+#         port=PORT,
+#         reload=False,
+#     )
