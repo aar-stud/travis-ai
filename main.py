@@ -23,10 +23,10 @@ CHROMA_PATH = "./knowledge_base/chroma_store"
 # STEP 1 — Force torch._C to load once, cleanly, FIRST
 # =========================================================
 # On Windows, torch bundles its own DLLs. If any other package
-# (spacy, torchtext, onnxruntime) triggers a torch import before
-# this block, torch._C is registered under a different DLL path,
-# causing "cannot load module more than once" and
-# "name '_C' is not defined" across the entire process.
+# triggers a torch import before this block, torch._C is registered
+# under a different DLL path causing "cannot load module more than
+# once" across the entire process.
+# The os.add_dll_directory call is a no-op on Linux (guarded below).
 # =========================================================
 
 if sys.platform == "win32":
@@ -48,9 +48,9 @@ except Exception as _e:
 # =========================================================
 # STEP 2 — ChromaDB: ingest BEFORE any router touches it
 # =========================================================
-# Routers are imported at module-load time (below), so ChromaDB
-# must exist on disk before that happens, or the RAG router's
-# import-time collection open will fail.
+# Routers are imported at module-load time (below). ChromaDB must
+# exist on disk before that, or the RAG router's import-time
+# collection open will fail.
 # =========================================================
 
 if not os.path.exists(CHROMA_PATH):
@@ -58,7 +58,6 @@ if not os.path.exists(CHROMA_PATH):
     print("[init] Running RAG ingestion pipeline...\n")
     try:
         from rag.ingest import main as ingest_main
-
         ingest_main()
         print("[init] ChromaDB successfully created.\n")
     except Exception as _e:
@@ -67,7 +66,7 @@ else:
     print("[init] Existing ChromaDB found.\n")
 
 # =========================================================
-# STEP 3 — FastAPI + middleware (safe to import now)
+# STEP 3 — FastAPI (safe to import now)
 # =========================================================
 
 import uvicorn
@@ -85,27 +84,18 @@ _failed_services = []
 async def lifespan(app: FastAPI):
     """
     Startup + shutdown lifecycle.
-    Handles:
-    - model warmup  (torch and ChromaDB are already stable by this point)
-    - service health summary
+    torch and ChromaDB are already stable by the time this runs.
     """
 
     print("\n================================================")
     print(" TRAVIS Multi-Service AI API Starting")
     print("================================================\n")
-
-    # =====================================================
-    # Warmup Models
-    # =====================================================
-
     print("[startup] Warming up ML models...\n")
 
     # 1. QA Model
     try:
         from bank.qa_routes import generate_response
-
         generate_response("what is a bank account")
-
         print("[startup] QA model warm.")
     except Exception as e:
         print(f"[startup] QA warmup failed: {e}")
@@ -113,7 +103,6 @@ async def lifespan(app: FastAPI):
     # 2. Translation
     try:
         from translation.translate_routes import _load_custom_model
-
         if _load_custom_model():
             print("[startup] Translation model warm.")
         else:
@@ -123,20 +112,8 @@ async def lifespan(app: FastAPI):
 
     # 3. Intent Classifier
     try:
-        from category.classifer_routes import (
-            predict_category,
-            model,
-            vocab,
-            label_encoder,
-        )
-
-        predict_category(
-            "what is my account balance",
-            model,
-            vocab,
-            label_encoder,
-        )
-
+        from category.classifer_routes import predict_category, model, vocab, label_encoder
+        predict_category("what is my account balance", model, vocab, label_encoder)
         print("[startup] Classifier model warm.")
     except Exception as e:
         print(f"[startup] Classifier warmup failed: {e}")
@@ -144,9 +121,7 @@ async def lifespan(app: FastAPI):
     # 4. SentenceTransformer Embedding Model
     try:
         from rag.embedder import get_model
-
         get_model()
-
         print("[startup] RAG embedding model warm.")
     except Exception as e:
         print(f"[startup] Embedder warmup failed: {e}")
@@ -154,9 +129,7 @@ async def lifespan(app: FastAPI):
     # 5. ChromaDB Connection
     try:
         from rag.retriever import _get_collection
-
         col = _get_collection()
-
         print(f"[startup] ChromaDB connected — {col.count()} chunks indexed.")
     except Exception as e:
         print(f"[startup] ChromaDB connection failed: {e}")
@@ -165,10 +138,8 @@ async def lifespan(app: FastAPI):
     try:
         from rag.embedder import embed_query
         from rag.retriever import retrieve
-
         vec = embed_query("hello")
         retrieve(vec, top_k=1)
-
         print("[startup] RAG pipeline warm.")
     except Exception as e:
         print(f"[startup] RAG warmup failed: {e}")
@@ -176,10 +147,6 @@ async def lifespan(app: FastAPI):
     print("\n[startup] TRAVIS AI API Ready.\n")
 
     yield
-
-    # =====================================================
-    # Shutdown
-    # =====================================================
 
     print("\n[shutdown] TRAVIS AI API shutting down...\n")
 
@@ -196,18 +163,16 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change in production if needed
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================================================
-# STEP 4 — Safe Router Loading
-# =========================================================
-# torch._C is already in the module registry (Step 1) and
-# ChromaDB exists on disk (Step 2), so all router imports
-# are now safe.
+# STEP 4 — Router loading
+# torch._C is stable (Step 1) and ChromaDB exists (Step 2)
+# so all router imports are safe now.
 # =========================================================
 
 
@@ -215,25 +180,16 @@ def _try_include(label, import_fn):
     try:
         router = import_fn()
         app.include_router(router)
-
         print(f"[router] OK   — {label}")
-
     except Exception as e:
         _failed_services.append(label)
-
         print(f"[router] SKIP — {label}: {e}")
 
-
-# =========================================================
-# Routers
-# =========================================================
 
 # 1. QA
 def _load_qa():
     from bank.qa_routes import qa_router
-
     return qa_router
-
 
 _try_include("qa (seq2seq)", _load_qa)
 
@@ -241,9 +197,7 @@ _try_include("qa (seq2seq)", _load_qa)
 # 2. Translation
 def _load_translation():
     from translation.translate_routes import translation_router
-
     return translation_router
-
 
 _try_include("translation (en→te)", _load_translation)
 
@@ -251,9 +205,7 @@ _try_include("translation (en→te)", _load_translation)
 # 3. TTS
 def _load_tts():
     from tts.tts_routes import tts_router
-
     return tts_router
-
 
 _try_include("tts", _load_tts)
 
@@ -261,9 +213,7 @@ _try_include("tts", _load_tts)
 # 4. Classifier
 def _load_classifier():
     from category.classifer_routes import router as classifier_router
-
     return classifier_router
-
 
 _try_include("classifier", _load_classifier)
 
@@ -271,9 +221,7 @@ _try_include("classifier", _load_classifier)
 # 5. RAG
 def _load_rag():
     from rag.rag_routes import rag_router
-
     return rag_router
-
 
 _try_include("rag", _load_rag)
 
@@ -289,12 +237,12 @@ async def root():
         "status": "running",
         "failed_services": _failed_services,
         "services": {
-            "qa": "/api/predict",
+            "qa":         "/api/predict",
             "classifier": "/api/classify",
-            "translation": "/api/translate",
-            "tts": "/api/tts",
-            "rag": "/api/rag",
-            "health": "/health",
+            "translation":"/api/translate",
+            "tts":        "/api/tts",
+            "rag":        "/api/rag",
+            "health":     "/health",
         },
     }
 
@@ -313,9 +261,4 @@ async def health():
 # =========================================================
 
 # if __name__ == "__main__":
-#     uvicorn.run(
-#         "main:app",
-#         host="0.0.0.0",
-#         port=PORT,
-#         reload=False,
-#     )
+#     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)

@@ -1,35 +1,58 @@
 """
 classifer_routes.py — Intent classification for banking queries.
 
-FIXED: torch imports and model loading are now fully lazy (deferred to
-first request). Previously, module-level torch imports and torch.load()
-were corrupting torch._C before main.py's pre-load guard could run,
-breaking every other ML service in the process.
+FIXED 1: NumPy _reconstruct compatibility shim added before pickle loads.
+         Fixes "First argument must be a sub-type of ndarray" on Linux when
+         .pkl was serialized on a different platform/numpy build.
+
+FIXED 2: Added /api/query/category alias route so the frontend Dashboard
+         call to POST /api/query/category resolves correctly.
+
+FIXED 3: torch imports and model loading are fully lazy (deferred to
+         first request) to avoid corrupting torch._C before main.py's
+         pre-load guard runs.
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Dict
 import pickle
 import os
 import re
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# =========================================================
+# NumPy _reconstruct compatibility shim
+# MUST run before any pickle.load() call on sklearn objects.
+# Fixes cross-platform pickle loading when LabelEncoder.classes_
+# was serialized with a different numpy C-ABI build.
+# =========================================================
+
+import numpy as np
+import numpy.core.multiarray as _nmc
+
+_original_reconstruct = _nmc._reconstruct
+
+def _patched_reconstruct(subtype, *args, **kwargs):
+    if not issubclass(subtype, np.ndarray):
+        subtype = np.ndarray
+    return _original_reconstruct(subtype, *args, **kwargs)
+
+_nmc._reconstruct = _patched_reconstruct
 
 # =========================================================
 # Configuration
 # =========================================================
 
-MAX_LEN        = 64
-EMBED_DIM      = 128
-N_HEADS        = 4
+BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
+MAX_LEN            = 64
+EMBED_DIM          = 128
+N_HEADS            = 4
 NUM_ENCODER_LAYERS = 2
-FF_DIM         = 256
-SAVE_PATH      = "best_transformer_model_90.pth"
+FF_DIM             = 256
+SAVE_PATH          = "best_transformer_model_90.pth"
 
 # =========================================================
 # Load vocab and label encoder at import time — safe,
-# these are pure Python pickle files, no C extensions.
+# these are pure Python pickle files (now shim-protected).
 # =========================================================
 
 with open(os.path.join(BASE_DIR, "vocab_90.pkl"), "rb") as f:
@@ -80,9 +103,9 @@ def _get_model():
         def __init__(self, vocab_size, embed_dim, num_heads, ff_dim,
                      num_layers, num_classes):
             super().__init__()
-            self.embedding  = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-            self.pos_encoder = PositionalEncoding(embed_dim)
-            encoder_layer   = nn.TransformerEncoderLayer(
+            self.embedding       = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+            self.pos_encoder     = PositionalEncoding(embed_dim)
+            encoder_layer        = nn.TransformerEncoderLayer(
                 embed_dim, num_heads, ff_dim, batch_first=True
             )
             self.transformer_encoder = nn.TransformerEncoder(
@@ -126,7 +149,7 @@ def word_tokenize(text: str) -> list:
 
 
 def encode_query(query: str, vocab: dict):
-    """Tokenize and pad query. Returns a torch.Tensor on first real call."""
+    """Tokenize and pad query. Returns a torch.Tensor."""
     import torch
 
     tokens  = word_tokenize(query.lower())
@@ -138,7 +161,7 @@ def encode_query(query: str, vocab: dict):
 def predict_category(query: str, model, vocab: dict, label_encoder) -> str:
     import torch
 
-    _, device = _get_model()          # ensures _device is set
+    _, device = _get_model()
     model.eval()
     with torch.no_grad():
         input_tensor    = encode_query(query, vocab).to(device)
@@ -158,8 +181,8 @@ class QueryInput(BaseModel):
     query: str
 
 
-@router.post("/classify")
-async def classify_query(input_data: QueryInput):
+async def _run_classification(input_data: QueryInput):
+    """Shared logic used by both routes."""
     query = input_data.query
     if not query:
         raise HTTPException(status_code=400, detail="Query field is required")
@@ -169,6 +192,18 @@ async def classify_query(input_data: QueryInput):
         return {"category": category}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/classify")
+async def classify_query(input_data: QueryInput):
+    """Primary classification endpoint."""
+    return await _run_classification(input_data)
+
+
+@router.post("/query/category")
+async def classify_query_category(input_data: QueryInput):
+    """Alias route — matches the Dashboard frontend call to /api/query/category."""
+    return await _run_classification(input_data)
 
 
 @router.get("/")

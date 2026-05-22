@@ -1,9 +1,9 @@
 """
 qa_routes.py - Transformer-based QA for banking domain.
 
-FIXED: torch imports and model loading are now lazy (deferred to first
-request). Previously, module-level torch.load() was corrupting torch._C
-before main.py's pre-load guard could run, breaking every other ML service.
+FIXED: All torch imports and model loading are lazy (first request only).
+Previously module-level torch.load() corrupted torch._C before main.py's
+pre-load guard ran, breaking every other ML service.
 """
 
 import json
@@ -15,19 +15,14 @@ from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Special token constants
 PAD_TOKEN = "<PAD>"
 SOS_TOKEN = "<SOS>"
 EOS_TOKEN = "<EOS>"
 UNK_TOKEN = "<UNK>"
 
-# Create router for QA service
 qa_router = APIRouter(prefix="/api", tags=["Question Answering"])
 
-# =========================================================
-# Load vocab at import time — safe, it's just JSON, no torch
-# =========================================================
-
+# vocab is plain JSON — safe to load at import time (no C extensions)
 with open(os.path.join(BASE_DIR, "model_artifacts/vocabulary_0.02.json")) as f:
     vocab = json.load(f)
 
@@ -35,7 +30,7 @@ inv_vocab  = {v: k for k, v in vocab.items()}
 vocab_size = len(vocab)
 
 # =========================================================
-# Lazy globals — torch and model loaded on first request
+# Lazy globals
 # =========================================================
 
 _model  = None
@@ -43,7 +38,6 @@ _device = None
 
 
 def _get_model():
-    """Load model once, lazily, on first call."""
     global _model, _device
 
     if _model is not None:
@@ -54,8 +48,6 @@ def _get_model():
     import numpy as np
 
     _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ------- Model Classes (defined here so torch is already imported) -------
 
     class PositionalEncoding(nn.Module):
         def __init__(self, d_model, max_len=5000):
@@ -73,18 +65,21 @@ def _get_model():
             return x + self.pe[:, : x.size(1), :].to(x.device)
 
     class TransformerQA(nn.Module):
-        def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=4, dropout=0.1):
+        def __init__(self, vocab_size, d_model=256, nhead=8,
+                     num_layers=4, dropout=0.1):
             super().__init__()
-            self.embedding  = nn.Embedding(vocab_size, d_model, padding_idx=0)
+            self.embedding   = nn.Embedding(vocab_size, d_model, padding_idx=0)
             self.pos_encoder = PositionalEncoding(d_model)
-            encoder_layer   = nn.TransformerEncoderLayer(
-                d_model, nhead, dim_feedforward=1024, dropout=dropout, batch_first=True
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model, nhead, dim_feedforward=1024,
+                dropout=dropout, batch_first=True,
             )
-            decoder_layer   = nn.TransformerDecoderLayer(
-                d_model, nhead, dim_feedforward=1024, dropout=dropout, batch_first=True
+            dec_layer = nn.TransformerDecoderLayer(
+                d_model, nhead, dim_feedforward=1024,
+                dropout=dropout, batch_first=True,
             )
-            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-            self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+            self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+            self.decoder = nn.TransformerDecoder(dec_layer, num_layers=num_layers)
             self.fc      = nn.Linear(d_model, vocab_size)
 
         def forward(self, src, tgt, src_key_padding_mask=None, tgt_mask=None):
@@ -98,8 +93,6 @@ def _get_model():
             )
             return self.fc(output)
 
-    # ------- Load weights -------
-
     m = TransformerQA(vocab_size).to(_device)
     m.load_state_dict(
         torch.load(
@@ -109,24 +102,22 @@ def _get_model():
     )
     m.eval()
     _model = m
-
     return _model, _device
 
 
 # =========================================================
-# Pure-python helpers (no torch dependency)
+# Pure-python helpers
 # =========================================================
 
 def preprocess(text: str) -> str:
-    text = re.sub(r"\W", " ", text)
-    return text.lower().strip()
+    return re.sub(r"\W", " ", text).lower().strip()
 
 
 def tokenize(text: str) -> list:
     return [vocab.get(word, vocab[UNK_TOKEN]) for word in text.split()]
 
 
-def decode(tokens):
+def decode(tokens: list) -> str:
     skip = {vocab["<PAD>"], vocab["<EOS>"], vocab["<SOS>"]}
     return " ".join(inv_vocab.get(t, "<UNK>") for t in tokens if t not in skip)
 
@@ -140,30 +131,26 @@ def generate_response(query: str, max_len: int = 5000) -> str:
 
     model, device = _get_model()
 
-    query      = preprocess(query)
-    query_ids  = tokenize(query)
-    query_tensor = torch.tensor(
-        query_ids, dtype=torch.long
-    ).unsqueeze(0).to(device)
-
-    src_mask  = (query_tensor == vocab["<PAD>"])
-    generated = [vocab["<SOS>"]]
+    query        = preprocess(query)
+    query_ids    = tokenize(query)
+    query_tensor = torch.tensor(query_ids, dtype=torch.long).unsqueeze(0).to(device)
+    src_mask     = (query_tensor == vocab["<PAD>"])
+    generated    = [vocab["<SOS>"]]
 
     model.eval()
     with torch.no_grad():
         for _ in range(max_len):
             tgt_tensor = torch.tensor(generated, dtype=torch.long).unsqueeze(0).to(device)
             tgt_mask   = torch.triu(
-                torch.full((len(generated), len(generated)), float("-inf")), diagonal=1
+                torch.full((len(generated), len(generated)), float("-inf")),
+                diagonal=1,
             ).to(device)
-
             out        = model(
                 query_tensor, tgt_tensor,
                 src_key_padding_mask=src_mask,
                 tgt_mask=tgt_mask,
             )
             next_token = out[0, -1, :].argmax().item()
-
             if next_token == vocab["<EOS>"]:
                 break
             generated.append(next_token)

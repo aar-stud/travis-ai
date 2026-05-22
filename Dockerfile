@@ -1,61 +1,74 @@
-FROM python:3.11-slim
+# -----------------------------------------------------------------------
+# CRITICAL: python:3.10-slim — NOT 3.11
+# torch==2.1.2 has no prebuilt Linux wheel for Python 3.11.
+# -----------------------------------------------------------------------
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies
-# libgomp1 is required by scikit-learn, spacy, onnxruntime (OpenMP threading)
+# libgomp1 — OpenMP threading for scikit-learn, spacy, onnxruntime
+# patchelf  — clears PT_GNU_STACK RWE flag on onnxruntime's .so
+#             Railway's kernel blocks shared libs with executable stack
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgomp1 \
+    patchelf \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security
+# Non-root user
 RUN addgroup --system travis && adduser --system --ingroup travis travis
 
-# Copy requirements
 COPY requirements.txt .
 
-# Install PyTorch CPU-only FIRST (avoids downloading 1.5GB of CUDA libs)
+# Install PyTorch family from the torch CPU index.
+# torchtext MUST come from this same index — PyPI has no matching wheel.
 RUN pip install --no-cache-dir \
     torch==2.1.2 \
     torchvision==0.16.2 \
     torchaudio==2.1.2 \
+    torchtext==0.16.2 \
     --index-url https://download.pytorch.org/whl/cpu
 
-# Write a clean requirements file without torch lines, then install
-# (avoids fragile grep | stdin pipe)
-RUN grep -v -E "^(torch==|torchvision==|torchaudio==|#|^$)" requirements.txt \
-    > /tmp/requirements_no_torch.txt && \
-    pip install --no-cache-dir -r /tmp/requirements_no_torch.txt && \
-    rm /tmp/requirements_no_torch.txt
+# Smoke-test torch + torchtext before installing anything else
+RUN python -c "import torch, torch.nn, torchtext; _ = torch.zeros(1); print('torch:', torch.__version__, '| torchtext:', torchtext.__version__)"
 
-# Download spacy model (must be before switching to non-root user)
-RUN python -m spacy download en_core_web_sm
+# Install everything else from PyPI (torch family excluded)
+RUN grep -v -E "^(torch==|torchvision==|torchaudio==|torchtext==|#|^$)" requirements.txt \
+    > /tmp/req.txt && \
+    pip install --no-cache-dir -r /tmp/req.txt && \
+    rm /tmp/req.txt
 
-# Copy application code
+# Clear executable-stack flag on onnxruntime .so — Railway's kernel
+# security policy (seccomp) rejects PT_GNU_STACK RWE shared objects.
+RUN patchelf --clear-execstack \
+    /usr/local/lib/python3.10/site-packages/onnxruntime/capi/onnxruntime_pybind11_state.cpython-310-x86_64-linux-gnu.so
+
+# Pin spacy model — avoids pulling an incompatible latest version
+RUN pip install --no-cache-dir \
+    https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+
+# Full ML stack smoke-test — build fails here if anything is broken
+RUN python -c "import torch, torchtext, numpy as np, spacy, transformers, sentence_transformers; import chromadb; _ = chromadb.PersistentClient; print('ML stack OK | torch:', torch.__version__, '| numpy:', np.__version__, '| torchtext:', torchtext.__version__)"
+
 COPY . .
 
-# Create cache directories with proper permissions before switching to non-root user
-RUN mkdir -p /app/.cache/sentence_transformers && \
-    mkdir -p /app/.cache/huggingface && \
+RUN mkdir -p /app/.cache/sentence_transformers /app/.cache/huggingface && \
     chown -R travis:travis /app
 
-RUN find /usr/local/lib/python3.11 -type d -name "__pycache__" -exec rm -rf {} +
-RUN find /app -type d -name "__pycache__" -exec rm -rf {} +
+RUN find /usr/local/lib/python3.10 -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+RUN find /app -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 USER travis
 
-# Set cache directories to writable locations
 ENV HF_HOME=/app/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
 ENV SENTENCE_TRANSFORMERS_HOME=/app/.cache/sentence_transformers
 
-# knowledge_base is mounted at runtime — do NOT copy it into the image.
-# docker run -v "<repo>/knowledge_base:/knowledge_base:ro" travis-ai
+# knowledge_base is mounted at runtime:
+# docker run -v "<repo>/knowledge_base:/app/knowledge_base" travis-ai
 
 EXPOSE 5001
 
-# start-period is 120s — ML models (transformers, chromadb) take time to load
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5001/health')" || exit 1
 

@@ -2,16 +2,12 @@
 translate_routes.py - English to Telugu translation.
 
 Uses the custom seq2seq transformer trained from scratch.
-All ML imports are lazy (deferred to first request) so a failure
-does NOT crash the FastAPI service at startup.
+All ML imports are lazy (deferred to first request).
 
-FIXED: Replaced `torchtext.data.utils.get_tokenizer` with a direct
-spacy call. torchtext has no prebuilt Linux wheel and forces a source
-build that collides with torch._C. spacy is already installed and
-provides identical tokenisation for "en_core_web_sm".
+torchtext is installed from the PyTorch CPU index alongside torch,
+so vocab_transform_en.pt and vocab_transform_te.pt load normally.
 
-Falls back to deep-translator (GoogleTranslator) if the custom model
-file is missing, corrupt, or if spacy/torch fail to load.
+Falls back to deep-translator if the custom model fails.
 """
 
 from fastapi import APIRouter, HTTPException
@@ -35,7 +31,6 @@ DROPOUT            = 0.1
 UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
 SPECIAL_SYMBOLS = ["<unk>", "<pad>", "<bos>", "<eos>"]
 
-# Lazy globals
 _model           = None
 _vocab_transform = None
 _text_transform  = None
@@ -44,16 +39,6 @@ _custom_failed   = False
 
 
 def _make_model_class(torch, nn):
-    """
-    Seq2Seq Transformer whose attribute names match the saved checkpoint.
-    Checkpoint keys:
-      positional_encoding.pos_embedding   <- attribute MUST be named positional_encoding
-      src_tok_emb.embedding.weight
-      tgt_tok_emb.embedding.weight
-      transformer.*
-      generator.*
-    """
-
     class SinusoidalPositionalEncoding(nn.Module):
         def __init__(self, emb_size, dropout, maxlen=5000):
             super().__init__()
@@ -80,24 +65,20 @@ def _make_model_class(torch, nn):
             return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
 
     class Seq2SeqTransformer(nn.Module):
-        def __init__(
-            self, enc_layers, dec_layers, emb_size, nhead,
-            src_vocab, tgt_vocab, ff_dim=512, dropout=0.1, maxlen=5000,
-        ):
+        def __init__(self, enc_layers, dec_layers, emb_size, nhead,
+                     src_vocab, tgt_vocab, ff_dim=512, dropout=0.1, maxlen=5000):
             super().__init__()
             self.transformer = nn.Transformer(
-                d_model=emb_size,
-                nhead=nhead,
+                d_model=emb_size, nhead=nhead,
                 num_encoder_layers=enc_layers,
                 num_decoder_layers=dec_layers,
                 dim_feedforward=ff_dim,
                 dropout=dropout,
                 batch_first=True,
             )
-            self.generator   = nn.Linear(emb_size, tgt_vocab)
-            self.src_tok_emb = TokenEmbedding(src_vocab, emb_size)
-            self.tgt_tok_emb = TokenEmbedding(tgt_vocab, emb_size)
-            # IMPORTANT: must be named positional_encoding to match checkpoint keys
+            self.generator           = nn.Linear(emb_size, tgt_vocab)
+            self.src_tok_emb         = TokenEmbedding(src_vocab, emb_size)
+            self.tgt_tok_emb         = TokenEmbedding(tgt_vocab, emb_size)
             self.positional_encoding = SinusoidalPositionalEncoding(
                 emb_size, dropout, maxlen
             )
@@ -122,35 +103,7 @@ def _make_model_class(torch, nn):
     return Seq2SeqTransformer
 
 
-def _make_en_tokenizer():
-    """
-    Build an English tokenizer using spacy directly.
-
-    Previously used:
-        from torchtext.data.utils import get_tokenizer
-        get_tokenizer("spacy", language="en_core_web_sm")
-
-    torchtext has no prebuilt Linux wheel, so it compiles from source
-    and its C extension collides with torch._C. spacy is already
-    installed and provides the identical tokenizer pipeline.
-    """
-    import spacy
-
-    nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "tagger"])
-
-    def _tokenize(text: str):
-        return [tok.text for tok in nlp(text)]
-
-    return _tokenize
-
-
 def _load_custom_model():
-    """
-    Load the custom seq2seq model lazily on first translate request.
-
-    Returns True  — custom model loaded, ready to use.
-    Returns False — load failed, caller should use deep-translator fallback.
-    """
     global _model, _vocab_transform, _text_transform, _device, _custom_failed
 
     if _model is not None:
@@ -161,42 +114,26 @@ def _load_custom_model():
     try:
         import torch
         import torch.nn as nn
+        from torchtext.data.utils import get_tokenizer
 
         _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"[translation] Loading custom model on {_device} ...")
 
-        # ---- Vocab ----
-        vocab_en_path = os.path.join(BASE_DIR, "vocab_transform_en.pt")
-        vocab_te_path = os.path.join(BASE_DIR, "vocab_transform_te.pt")
-
-        if not os.path.exists(vocab_en_path) or not os.path.exists(vocab_te_path):
-            raise FileNotFoundError(
-                f"Vocab files not found in {BASE_DIR}. "
-                "Expected vocab_transform_en.pt and vocab_transform_te.pt"
-            )
-
         _vocab_transform = {
-            "en": torch.load(vocab_en_path, map_location=_device, weights_only=False),
-            "te": torch.load(vocab_te_path, map_location=_device, weights_only=False),
+            "en": torch.load(
+                os.path.join(BASE_DIR, "vocab_transform_en.pt"),
+                map_location=_device, weights_only=False,
+            ),
+            "te": torch.load(
+                os.path.join(BASE_DIR, "vocab_transform_te.pt"),
+                map_location=_device, weights_only=False,
+            ),
         }
         src_vocab = len(_vocab_transform["en"])
         tgt_vocab = len(_vocab_transform["te"])
 
-        # ---- Tokenizers ----
-        # English: spacy (replaces torchtext.data.utils.get_tokenizer)
-        # Telugu:  whitespace split (unchanged from original)
-        token_transform = {
-            "en": _make_en_tokenizer(),
-            "te": lambda text: text.split(),
-        }
-
-        # ---- Text pipeline: tokenize → vocab lookup → add BOS/EOS ----
-        def _tensor_transform(token_ids):
-            return torch.cat((
-                torch.tensor([BOS_IDX]),
-                torch.tensor(token_ids),
-                torch.tensor([EOS_IDX]),
-            ))
+        def _tok_te(text):
+            return text.split()
 
         def _sequential(*transforms):
             def fn(x):
@@ -205,6 +142,17 @@ def _load_custom_model():
                 return x
             return fn
 
+        def _tensor_transform(token_ids):
+            return torch.cat((
+                torch.tensor([BOS_IDX]),
+                torch.tensor(token_ids),
+                torch.tensor([EOS_IDX]),
+            ))
+
+        token_transform = {
+            "en": get_tokenizer("spacy", language="en_core_web_sm"),
+            "te": _tok_te,
+        }
         _text_transform = {
             ln: _sequential(
                 token_transform[ln],
@@ -214,13 +162,9 @@ def _load_custom_model():
             for ln in ["en", "te"]
         }
 
-        # ---- Model ----
         model_path = os.path.join(
             BASE_DIR, "transformer_eng_tel_scratch_full_data.pt"
         )
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found: {model_path}")
-
         Seq2SeqTransformer = _make_model_class(torch, nn)
         m = Seq2SeqTransformer(
             NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS,
@@ -234,7 +178,6 @@ def _load_custom_model():
         )
         m.eval()
         _model = m
-
         print("[translation] Custom model loaded successfully.")
         return True
 
@@ -276,17 +219,12 @@ def _translate_custom(text: str, max_len: int = 100) -> str:
 def _translate_fallback(text: str) -> str:
     try:
         from deep_translator import GoogleTranslator
-
         return GoogleTranslator(source="en", target="te").translate(text)
     except ImportError:
         raise RuntimeError(
             "deep-translator not installed. Run: pip install deep-translator==1.11.4"
         )
 
-
-# =========================================================
-# API
-# =========================================================
 
 class TranslationRequest(BaseModel):
     sentence:   str
@@ -298,7 +236,6 @@ async def translate(request: TranslationRequest):
     text = request.sentence.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Empty text provided.")
-
     try:
         if _load_custom_model():
             result  = _translate_custom(text, max_len=request.max_length or 100)
@@ -314,7 +251,6 @@ async def translate(request: TranslationRequest):
             "language_pair": "en-te",
             "backend":       backend,
         }
-
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
