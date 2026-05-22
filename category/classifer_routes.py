@@ -19,6 +19,10 @@ import pickle
 import os
 import re
 
+import asyncio
+from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
+
 # =========================================================
 # NumPy _reconstruct compatibility shim
 # MUST run before any pickle.load() call on sklearn objects.
@@ -53,13 +57,38 @@ SAVE_PATH          = "best_transformer_model_90.pth"
 # =========================================================
 # Load vocab and label encoder at import time — safe,
 # these are pure Python pickle files (now shim-protected).
+# Gracefully handle missing files to avoid router registration failure.
 # =========================================================
 
-with open(os.path.join(BASE_DIR, "vocab_90.pkl"), "rb") as f:
-    vocab = pickle.load(f)
+vocab = None
+label_encoder = None
+_missing_files = []
 
-with open(os.path.join(BASE_DIR, "label_encoder_90.pkl"), "rb") as f:
-    label_encoder = pickle.load(f)
+vocab_path = os.path.join(BASE_DIR, "vocab_90.pkl")
+label_encoder_path = os.path.join(BASE_DIR, "label_encoder_90.pkl")
+
+if os.path.exists(vocab_path):
+    try:
+        with open(vocab_path, "rb") as f:
+            vocab = pickle.load(f)
+    except Exception as e:
+        print(f"[classifier] Warning: Failed to load vocab: {e}")
+        _missing_files.append("vocab_90.pkl")
+else:
+    _missing_files.append("vocab_90.pkl")
+
+if os.path.exists(label_encoder_path):
+    try:
+        with open(label_encoder_path, "rb") as f:
+            label_encoder = pickle.load(f)
+    except Exception as e:
+        print(f"[classifier] Warning: Failed to load label_encoder: {e}")
+        _missing_files.append("label_encoder_90.pkl")
+else:
+    _missing_files.append("label_encoder_90.pkl")
+
+if _missing_files:
+    print(f"[classifier] Warning: Missing required files: {', '.join(_missing_files)}")
 
 # =========================================================
 # Lazy globals — torch and model loaded on first request
@@ -158,14 +187,17 @@ def encode_query(query: str, vocab: dict):
     return torch.tensor([padded], dtype=torch.long)
 
 
-def predict_category(query: str, model, vocab: dict, label_encoder) -> str:
+# AFTER — resolves device from the global without triggering a second load
+def predict_category(query: str, model=None, vocab: dict = None, label_encoder=None) -> str:
     import torch
 
-    _, device = _get_model()
-    model.eval()
+    loaded_model, device = _get_model()          # safe: returns cached instance
+    _model_to_use = model if model is not None else loaded_model
+
+    _model_to_use.eval()
     with torch.no_grad():
-        input_tensor    = encode_query(query, vocab).to(device)
-        output          = model(input_tensor)
+        input_tensor    = encode_query(query, _model_to_use if False else vocab).to(device)
+        output          = _model_to_use(input_tensor)
         predicted_index = torch.argmax(output, dim=1).item()
         return label_encoder.inverse_transform([predicted_index])[0]
 
@@ -182,17 +214,33 @@ class QueryInput(BaseModel):
 
 
 async def _run_classification(input_data: QueryInput):
-    """Shared logic used by both routes."""
     query = input_data.query
     if not query:
         raise HTTPException(status_code=400, detail="Query field is required")
+
+    if vocab is None or label_encoder is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Classifier unavailable: missing {', '.join(_missing_files)}"
+        )
+
     try:
-        model, _ = _get_model()
-        category = predict_category(query, model, vocab, label_encoder)
-        return {"category": category}
+        # Run blocking inference in a thread so it doesn't block the event loop
+        # AND wrap with a timeout so it never hangs the client indefinitely.
+        result = await asyncio.wait_for(
+            run_in_threadpool(_classify_sync, query),
+            timeout=30.0          # 30 s hard limit
+        )
+        return {"category": result}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Classifier timed out")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def _classify_sync(query: str) -> str:
+    """Pure-sync wrapper — runs in threadpool, never on the event loop."""
+    model, _ = _get_model()
+    return predict_category(query, model, vocab, label_encoder)
 
 @router.post("/classify")
 async def classify_query(input_data: QueryInput):

@@ -117,7 +117,9 @@ def main():
 
     # Write to ChromaDB (always start fresh)
     os.makedirs(CHROMA_DIR, exist_ok=True)
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
+    from chromadb.config import Settings
+    settings = Settings(anonymized_telemetry=False)
+    client = chromadb.PersistentClient(path=CHROMA_DIR, settings=settings)
 
     try:
         client.delete_collection(COLLECTION)

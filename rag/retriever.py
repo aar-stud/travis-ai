@@ -5,6 +5,7 @@ given a pre-computed query embedding vector.
 
 import os
 import chromadb
+from chromadb.config import Settings
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 CHROMA_DIR = os.path.join(BASE_DIR, "..", "knowledge_base", "chroma_store")
@@ -22,7 +23,8 @@ def _get_collection():
                 f"ChromaDB store not found at {CHROMA_DIR!r}. "
                 "Run: python rag/ingest.py"
             )
-        _client = chromadb.PersistentClient(path=CHROMA_DIR)
+        settings = Settings(anonymized_telemetry=False)
+        _client = chromadb.PersistentClient(path=CHROMA_DIR, settings=settings)
         _collection = _client.get_collection(COLLECTION_NAME)
         print(f"[retriever] Connected to ChromaDB — {_collection.count()} chunks indexed.")
     return _collection

@@ -112,9 +112,19 @@ async def lifespan(app: FastAPI):
 
     # 3. Intent Classifier
     try:
-        from category.classifer_routes import predict_category, model, vocab, label_encoder
-        predict_category("what is my account balance", model, vocab, label_encoder)
-        print("[startup] Classifier model warm.")
+        from category.classifer_routes import predict_category, vocab, label_encoder, _get_model
+        if vocab is not None and label_encoder is not None:
+            model, _ = _get_model()
+            # AFTER — keywords make intent explicit and are forward-compatible
+            predict_category(
+                "what is my account balance",
+                model=model,
+                vocab=vocab,
+                label_encoder=label_encoder,
+            )
+            print("[startup] Classifier model warm.")
+        else:
+            print("[startup] Classifier skipped (missing vocab/label_encoder files).")
     except Exception as e:
         print(f"[startup] Classifier warmup failed: {e}")
 
