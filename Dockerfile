@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir \
     torchvision==0.16.2 \
     torchaudio==2.1.2 \
     torchtext==0.16.2 \
-    --index-url https://download.pytorch.org/whl/cpu
+    --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Smoke-test torch + torchtext before installing anything else
 RUN python -c "import torch, torch.nn, torchtext; _ = torch.zeros(1); print('torch:', torch.__version__, '| torchtext:', torchtext.__version__)"
