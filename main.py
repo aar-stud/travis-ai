@@ -112,7 +112,7 @@ async def lifespan(app: FastAPI):
 
     # 3. Intent Classifier
     try:
-        from category.classifer_routes import predict_category, vocab, label_encoder, _get_model
+        from category.classifier_routes import predict_category, vocab, label_encoder, _get_model
         if vocab is not None and label_encoder is not None:
             model, _ = _get_model()
             # AFTER — keywords make intent explicit and are forward-compatible
@@ -222,7 +222,7 @@ _try_include("tts", _load_tts)
 
 # 4. Classifier
 def _load_classifier():
-    from category.classifer_routes import router as classifier_router
+    from category.classifier_routes import router as classifier_router
     return classifier_router
 
 _try_include("classifier", _load_classifier)

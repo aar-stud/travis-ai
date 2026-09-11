@@ -23,7 +23,7 @@ rag_router = APIRouter(prefix="/api", tags=["RAG"])
 
 # Cosine distance: 0.0 = identical, 1.0 = completely different.
 # Keep chunks below this threshold — above it means too irrelevant.
-RELEVANCE_THRESHOLD = 0.55
+RELEVANCE_THRESHOLD = 0.65
 
 
 class RAGRequest(BaseModel):
@@ -46,8 +46,8 @@ async def rag_query(request: RAGRequest):
         # 1. Embed the query into a vector
         query_vector = embed_query(query)
 
-        # 2. Retrieve top-3 candidate chunks
-        raw_chunks = retrieve(query_vector, top_k=3)
+        # 2. Retrieve top-5 candidate chunks (increased from 3 because chunk size is smaller)
+        raw_chunks = retrieve(query_vector, top_k=5)
 
         # 3. Filter by relevance — strict threshold avoids pulling
         #    unrelated chunks when the query is misclassified

@@ -9,7 +9,7 @@ from chromadb.config import Settings
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 CHROMA_DIR = os.path.join(BASE_DIR, "..", "knowledge_base", "chroma_store")
-COLLECTION_NAME = "travis_banking_faq"
+COLLECTION_NAME = "travis_bank_policy"
 
 _client     = None
 _collection = None

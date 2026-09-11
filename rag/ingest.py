@@ -1,17 +1,9 @@
 """
 ingest.py — Run this ONCE (or on any knowledge base update).
 
-Reads knowledge_base/faqs.txt, splits strictly by Q&A pairs,
-cleans each chunk (strips section headers, blank lines),
+Reads markdown/text files in knowledge_base, chunks them using a recursive
+text splitter (to handle generic policies instead of just Q&A),
 embeds, and stores in ChromaDB.
-
-FIXED: chromadb and sentence_transformers imports are now inside
-main() rather than at module level. ingest.py is imported by
-main.py at module level for the auto-ingest check — any top-level
-ML imports here triggered C extension loading before torch was stable.
-
-Usage (from ai_services/ folder):
-    python rag/ingest.py
 """
 
 import os
@@ -20,67 +12,98 @@ import re
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 KB_DIR     = os.path.abspath(os.path.join(BASE_DIR, "..", "knowledge_base"))
 CHROMA_DIR = os.path.join(KB_DIR, "chroma_store")
-COLLECTION = "travis_banking_faq"
+COLLECTION = "travis_bank_policy"
 MODEL_NAME = "all-MiniLM-L6-v2"
 
-
-def clean_chunk(block: str) -> str:
+def chunk_text(text: str, max_size: int = 600, overlap: int = 100) -> list[str]:
     """
-    Remove anything that is NOT part of the Q&A:
-    - Section headers like  --- CUSTOMER SERVICE ---
-    - Title lines like      TRAVIS Banking Knowledge Base
-    - Trailing/leading blank lines
+    Context-aware Markdown chunking.
+    Tracks headers (##, ###) and injects them into the chunks so the embedding
+    model has full semantic context for smaller, more granular text blocks.
+    This saves LLM tokens and improves embedding match accuracy.
     """
-    # Remove section headers  --- ANY TEXT ---
-    block = re.sub(r"---[^\n]+---", "", block)
-    # Remove title/heading lines (all-caps words with no Q: or A:)
-    block = re.sub(r"(?m)^[A-Z][A-Z\s]+$\n?", "", block)
-    # Collapse multiple blank lines
-    block = re.sub(r"\n{2,}", "\n", block)
-    return block.strip()
+    lines = text.split('\n')
+    chunks = []
+    
+    current_h1 = ""
+    current_h2 = ""
+    current_h3 = ""
+    
+    current_text = ""
+    
+    def finalize_chunk(text_to_add):
+        ctx = []
+        if current_h1: ctx.append(current_h1)
+        if current_h2: ctx.append(current_h2)
+        if current_h3: ctx.append(current_h3)
+        context_str = "Topic: " + " > ".join(ctx) + "\n" if ctx else ""
+        return context_str + text_to_add.strip()
 
+    for line in lines:
+        if line.startswith("# "):
+            current_h1 = line[2:].strip()
+            current_h2 = ""
+            current_h3 = ""
+            continue
+        elif line.startswith("## "):
+            current_h2 = line[3:].strip()
+            current_h3 = ""
+            continue
+        elif line.startswith("### "):
+            current_h3 = line[4:].strip()
+            continue
+            
+        if not line.strip():
+            continue
+            
+        if len(current_text) + len(line) > max_size and current_text.strip():
+            chunks.append(finalize_chunk(current_text))
+            # Keep overlap by grabbing the last few words
+            words = current_text.split()
+            current_text = " ".join(words[-20:]) + " " + line + "\n"
+        else:
+            current_text += line + "\n"
+            
+    if current_text.strip():
+        chunks.append(finalize_chunk(current_text))
+        
+    return chunks
 
 def load_and_chunk(kb_dir: str) -> list:
     """
-    Load every .txt file in kb_dir.
-    Split strictly on lines that start with 'Q:' — one chunk per Q&A pair.
-    Clean each chunk before storing.
+    Load .md files in kb_dir (ignoring old faqs.txt).
+    Split them into semantic overlapping chunks.
     """
     all_chunks = []
 
     for fname in sorted(os.listdir(kb_dir)):
-        if not fname.endswith(".txt"):
+        # Only process markdown files, ignore txt files like faqs.txt
+        if not fname.endswith(".md"):
             continue
+            
         fpath = os.path.join(kb_dir, fname)
         with open(fpath, "r", encoding="utf-8") as f:
             text = f.read()
 
-        # Split so every piece starts with Q:
-        raw_blocks = re.split(r"(?m)^(?=Q:)", text)
-        blocks     = [clean_chunk(b) for b in raw_blocks if b.strip().startswith("Q:")]
+        # Generate chunks with smaller max_size to save LLM tokens
+        blocks = chunk_text(text, max_size=600, overlap=100)
 
-        # Keep only blocks that have both a question AND an answer
-        valid = [b for b in blocks if "Q:" in b and "A:" in b]
-
-        for i, block in enumerate(valid):
+        for i, block in enumerate(blocks):
+            # Clean up the ID to be alphanumeric
+            clean_name = re.sub(r'[^a-zA-Z0-9_]', '', fname.replace('.md', ''))
             all_chunks.append({
-                "id":     f"{fname}_q{i:03d}",
+                "id":     f"{clean_name}_chunk{i:04d}",
                 "source": fname,
                 "text":   block,
             })
 
-        skipped = len(blocks) - len(valid)
-        print(
-            f"[ingest] {fname}: {len(valid)} chunks"
-            + (f" ({skipped} skipped — no A: found)" if skipped else "")
-        )
+        print(f"[ingest] {fname}: {len(blocks)} chunks created")
 
     return all_chunks
 
 
 def main():
-    # Lazy imports — only loaded when ingest actually runs,
-    # not when the module is imported by main.py at startup.
+    # Lazy imports — only loaded when ingest actually runs
     import chromadb
     from sentence_transformers import SentenceTransformer
 
@@ -88,28 +111,18 @@ def main():
 
     chunks = load_and_chunk(KB_DIR)
     if not chunks:
-        print("[ingest] ERROR: no Q&A blocks found. Check knowledge_base/*.txt")
+        print("[ingest] ERROR: no .md blocks found. Check knowledge_base/*.md")
         return
 
     print(f"\n[ingest] Total chunks to index: {len(chunks)}")
 
-    # Preview first 3 to confirm no header leakage
-    print("\n[ingest] Sample chunks (verify no --- headers):")
+    print("\n[ingest] Sample chunks:")
     for c in chunks[:3]:
         preview = c["text"][:100].replace("\n", " ")
-        print(f"  [{c['id']}] {preview}")
-
-    # Check for accidental header leakage
-    leaks = [c for c in chunks if "---" in c["text"]]
-    if leaks:
-        print(f"\n[ingest] WARNING: {len(leaks)} chunks still contain '---' headers!")
-        for c in leaks:
-            print(f"  {c['id']}: {c['text'][:80]}")
-    else:
-        print("[ingest] Clean — no section headers found in any chunk.\n")
+        print(f"  [{c['id']}] {preview}...")
 
     # Embed
-    print(f"[ingest] Loading model '{MODEL_NAME}' ...")
+    print(f"\n[ingest] Loading model '{MODEL_NAME}' ...")
     model      = SentenceTransformer(MODEL_NAME)
     texts      = [c["text"] for c in chunks]
     print("[ingest] Embedding ...")

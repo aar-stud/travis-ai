@@ -65,3 +65,6 @@ gTTS==2.5.1
 # Misc
 regex==2023.12.25
 nltk==3.8.1
+
+# Gemini API Support
+google-generativeai>=0.8.0
